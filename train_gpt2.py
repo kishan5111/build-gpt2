@@ -195,4 +195,5 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
-                
+    
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
