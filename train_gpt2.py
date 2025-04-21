@@ -10,9 +10,9 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embed % config.n_head == 0
         # key, query, value projections for all heads, but in a batch 
-        self.c_attn = nn.Linear(config.n_embed, 3 * config.n_embed, bias=False)
+        self.c_attn = nn.Linear(config.n_embed, 3 * config.n_embed, bias=True)
         # output projection
-        self.c_proj = nn.Linear(config.n_embed, config.n_embed, bias=False)
+        self.c_proj = nn.Linear(config.n_embed, config.n_embed, bias=True)
         self.c_proj.NANOGPT_SCALE_UNIT = 1 
         # regularization
         self.n_head = config.n_head
@@ -51,9 +51,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
        super().__init__()
-       self.c_fc = nn.Linear(config.n_embed, 4 * config.n_embed, bias=False)
+       self.c_fc = nn.Linear(config.n_embed, 4 * config.n_embed, bias=True)
        self.GELU = nn.GELU(approximate="tanh")
-       self.c_proj = nn.Linear(4 * config.n_embed, config.n_embed, bias=False)
+       self.c_proj = nn.Linear(4 * config.n_embed, config.n_embed, bias=True)
               
     def forward(self, x):
         x = self.c_fc(x)
@@ -83,7 +83,7 @@ class GPTConfig:
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
-    n_embd: int = 768 # embedding dimension
+    n_embed: int = 768 # embedding dimension
 
 
 class GPT(nn.Module):
@@ -107,16 +107,16 @@ class GPT(nn.Module):
         # init params 
         self.apply(self._init_weights)
 
-        def _init_weights(self, module):
-            if isinstance(module, nn.Linear):
-                std = 0.02 
-                if hasattr(module, 'NANOGPT_SCALE_UNIT'):
-                    std *= (2 * self.config.n_layer) ** -0.5
-                torch.nn.init.normal_(module.weight, mean=0.0,std=std)
-                if module.bias is not None:
-                    torch.nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02 
+            if hasattr(module, 'NANOGPT_SCALE_UNIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0,std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             
 
     def forward(self, idx, targets=None):
@@ -155,7 +155,7 @@ class GPT(nn.Module):
         # n_layer, n_head and n_embed are determined by the model type
         config_args = {
             "gpt2": dict(n_layer=12, n_head=12, n_embed=768), #124M params
-            "gpt2-medium": dict(n_layer=24, n_head=12, n_embed=1024), #350M params
+            "gpt2-medium": dict(n_layer=24, n_head=16, n_embed=1024), #350M params
             "gpt2-large": dict(n_layer=36, n_head=20, n_embed=1280), #774M params
             "gpt2-xl": dict(n_layer=48, n_head=25, n_embed=1600), #1558M params
         }[model_type]
@@ -180,6 +180,10 @@ class GPT(nn.Module):
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # openai cp use "Conv1D" module, but we only want to use a vanilla layer
         # this means that we have to transpose these weights when we import them 
+           # Instead of asserting, find common keys between the two dictionaries
+        uncommon_keys =  set(sd_keys_hf) - set(sd_keys)
+        print(f"Your model has {len(sd_keys)} keys, HF model has {len(sd_keys_hf)} keys, {len(uncommon_keys)} keys in common")
+        print(f"Keys in uncommon: {uncommon_keys}")
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
@@ -187,7 +191,6 @@ class GPT(nn.Module):
                 assert sd_hf[k].shape[::-1] == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k].t())
-
             else:
                 # vanilla copy over the other parameters
                 assert sd_hf[k].shape == sd[k].shape
@@ -196,4 +199,63 @@ class GPT(nn.Module):
 
         return model
     
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+
+#--------------------------------
+num_return_sequences = 5
+max_length = 50
+
+# model = GPT(GPTConfig())
+model = GPT.from_pretrained("gpt2") #init from hf 
+model.eval()
+model.to("mps")
+
+
+
+# prefix tokens
+import tiktoken
+enc = tiktoken.get_encoding("gpt2")
+tokens = enc.encode("Hello, I'm a language model")
+tokens = torch.tensor(tokens, dtype=torch.long)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+x = tokens.to("mps")
+
+# generate right now x is (B, T) where B = 5,  T = 8
+# set the seed to 42
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    print(f"Generating text of length {x.size(1)}")
+    logits, loss = model(x)
+    print(f"Logits shape: {logits.shape} | Loss: {loss}`")
+    # logits is (B, T, vocab_size)
+    # we want to take the logits at the last position
+    logits = logits[:, -1, :] 
+    # apply softmax to get the probabilities
+    probs = F.softmax(logits, dim=-1)
+    # do top k sampling of 50 to match hf pipeline 
+    # topk_pros here becomes (5, 50), top_k.indices becomes (5, 50)
+    top_k_probs, top_k_indices = torch.topk(probs, k=50, dim=-1)
+    # select the indices of the top k probabilities
+    ix = torch.multinomial(top_k_probs, num_samples=1)
+    # gather the indices of the top k probabilities
+    xcol = torch.gather(top_k_indices, dim=-1, index=ix)
+    # concatenate the new tokens to the existing tokens
+    x = torch.cat((x, xcol), dim=1)
+
+
+# print  the generated text 
+for i in range(num_return_sequences):
+    print(f"Generated text {i+1}:")
+    decoded = enc.decode(x[i].tolist())
+    print(decoded)
+    print("-"*40)
+
+
+
+
+
+
+
+
+
+
