@@ -1,8 +1,11 @@
+import os 
+import math 
+import inspect
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
+from hellaswag import render_example, iterate_examples
 
 class CausalSelfAttention(nn.Module):
 
@@ -108,19 +111,22 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
+        # init weights for linear layers with normal distribution
         if isinstance(module, nn.Linear):
             std = 0.02 
+            # scale the std by the number of layers
             if hasattr(module, 'NANOGPT_SCALE_UNIT'):
                 std *= (2 * self.config.n_layer) ** -0.5
             torch.nn.init.normal_(module.weight, mean=0.0,std=std)
+            # init bias for linear layers with zeros
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
+            # init embedding weights with normal distribution
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             
 
     def forward(self, idx, targets=None):
-        device = idx.device
         B, T = idx.size() # idx is shape of batch size, sequence length
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
         #forward the token and position embeddings
@@ -180,10 +186,11 @@ class GPT(nn.Module):
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # openai cp use "Conv1D" module, but we only want to use a vanilla layer
         # this means that we have to transpose these weights when we import them 
-           # Instead of asserting, find common keys between the two dictionaries
+        # Instead of asserting, find common keys between the two dictionaries
         uncommon_keys =  set(sd_keys_hf) - set(sd_keys)
-        print(f"Your model has {len(sd_keys)} keys, HF model has {len(sd_keys_hf)} keys, {len(uncommon_keys)} keys in common")
-        print(f"Keys in uncommon: {uncommon_keys}")
+        if uncommon_keys:
+            print(f"Model has {len(sd_keys)} keys, HF model has {len(sd_keys_hf)} keys, {len(uncommon_keys)} keys in common")
+            print(f"Keys in uncommon: {uncommon_keys}")
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
@@ -199,6 +206,36 @@ class GPT(nn.Module):
 
         return model
     
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
+        # start with all of the candidate parameters (that requires grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create the optim groups. any paramerters that is 2d will be weight decayed, otherwise no 
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't
+        decay_params = [p for p in param_dict.values() if p.dim() >= 2]
+        nodecay_params = [p for p in param_dict.values() if p.dim() < 2]
+        # create the optimizer 
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0}
+        ]
+        # sum the number of elements in each parameter tensor
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+
+        # add masters_process code here
+
+
+        # create AdamW optimizer and use the fused version if it is available 
+        # fused allows for faster gradient updates, everything is done in the GPU
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
+        
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), 
+                                      eps = 1e-8, fused=use_fused)
+        print(f"using fused: {use_fused}")
+        print(f"num decayed parameter tensors: {len(decay_params)} | total parameters: {num_decay_params} | num non-decayed parameter tensors: {len(nodecay_params)} | total non-decayed parameters: {num_nodecay_params}")
+        return optimizer
 
 
 #--------------------------------
