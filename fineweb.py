@@ -17,7 +17,7 @@ from tqdm import tqdm
 #--------------------------------
 local_dir = "edu_fineweb10B"
 remote_name = "sample-10BT"
-shard_size = int(1e-8) #100M tokens per shard, total of 100 shards
+shard_size = int(1e8) #100M tokens per shard, total of 100 shards
 
 #  create the cache the local directory if it doesn't exist
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "local_dir")
@@ -69,7 +69,8 @@ with mp.Pool(nprocs) as pool:
             filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}")
             # split the document into whatever fits in this shard; the remainder goes to next one
             remainder = shard_size - token_count
-            progress_bar.update(remainder)
+            if progress_bar is None:
+               progress_bar.update(remainder)
             all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
             write_datafile(filename, all_tokens_np)
             shard_index += 1
